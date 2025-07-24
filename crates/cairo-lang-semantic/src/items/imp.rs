@@ -1,28 +1,34 @@
-use std::collections::BTreeSet;
+use std::collections::hash_map::RandomState;
+use std::collections::{BTreeSet, HashSet};
 use std::fmt::Write;
 use std::hash::Hash;
 use std::sync::Arc;
 use std::{mem, panic, vec};
 
 use cairo_lang_debug::DebugWithDb;
+use cairo_lang_defs::db;
 use cairo_lang_defs::ids::{
-    FunctionTitleId, GenericKind, GenericParamId, ImplAliasId, ImplConstantDefId,
-    ImplConstantDefLongId, ImplDefId, ImplFunctionId, ImplFunctionLongId, ImplImplDefId,
-    ImplImplDefLongId, ImplItemId, ImplTypeDefId, ImplTypeDefLongId, LanguageElementId,
-    LookupItemId, ModuleId, ModuleItemId, NamedLanguageElementId, NamedLanguageElementLongId,
-    TopLevelLanguageElementId, TraitConstantId, TraitFunctionId, TraitId, TraitImplId, TraitTypeId,
-    UseId,
+    FunctionTitleId, GenericKind, GenericParamId, GenericParamLongId, ImplAliasId,
+    ImplConstantDefId, ImplConstantDefLongId, ImplDefId, ImplFunctionId, ImplFunctionLongId,
+    ImplImplDefId, ImplImplDefLongId, ImplItemId, ImplTypeDefId, ImplTypeDefLongId,
+    LanguageElementId, LookupItemId, ModuleFileId, ModuleId, ModuleItemId, NamedLanguageElementId,
+    NamedLanguageElementLongId, TopLevelLanguageElementId, TraitConstantId, TraitFunctionId,
+    TraitId, TraitImplId, TraitTypeId, UseId,
 };
 use cairo_lang_diagnostics::{
     DiagnosticAdded, Diagnostics, DiagnosticsBuilder, Maybe, ToMaybe, skip_diagnostic,
 };
-use cairo_lang_filesystem::ids::UnstableSalsaId;
+use cairo_lang_filesystem::ids::{CrateId, CrateLongId, UnstableSalsaId};
 use cairo_lang_proc_macros::{DebugWithDb, SemanticObject};
 use cairo_lang_syntax as syntax;
-use cairo_lang_syntax::node::ast::OptionTypeClause;
+use cairo_lang_syntax::node::ast::{
+    GenericArgValue, OptionTypeClause, OptionWrappedGenericParamList, UnaryOperator,
+    WrappedGenericParamList,
+};
 use cairo_lang_utils::ordered_hash_map::OrderedHashMap;
 use cairo_lang_utils::ordered_hash_set::OrderedHashSet;
 use cairo_lang_utils::unordered_hash_map::UnorderedHashMap;
+use cairo_lang_utils::unordered_hash_set::UnorderedHashSet;
 use cairo_lang_utils::{Intern, LookupIntern, define_short_id, extract_matches};
 use itertools::{Itertools, chain, izip};
 use smol_str::SmolStr;
@@ -46,7 +52,7 @@ use super::functions::{
 };
 use super::generics::{
     GenericArgumentHead, GenericParamImpl, GenericParamsData, fmt_generic_args,
-    generic_params_to_args, semantic_generic_params,
+    generic_impl_param_trait, generic_params_to_args, semantic_generic_params,
 };
 use super::impl_alias::{
     ImplAliasData, impl_alias_generic_params_data_helper, impl_alias_semantic_data_cycle_helper,
@@ -62,7 +68,7 @@ use super::type_aliases::{
 };
 use super::visibility::peek_visible_in;
 use super::{TraitOrImplContext, resolve_trait_path};
-use crate::corelib::{concrete_destruct_trait, concrete_drop_trait, core_crate};
+use crate::corelib::{concrete_destruct_trait, concrete_drop_trait, core_crate, core_submodule};
 use crate::db::{SemanticGroup, get_resolver_data_options};
 use crate::diagnostic::SemanticDiagnosticKind::{self, *};
 use crate::diagnostic::{NotFoundItemType, SemanticDiagnostics, SemanticDiagnosticsBuilder};
@@ -75,12 +81,19 @@ use crate::expr::inference::solver::{Ambiguity, SolutionSet, enrich_lookup_conte
 use crate::expr::inference::{
     ImplVarId, ImplVarTraitItemMappings, Inference, InferenceError, InferenceId,
 };
+use crate::helper::ModuleHelper;
 use crate::items::function_with_body::get_implicit_precedence;
 use crate::items::functions::ImplicitPrecedence;
 use crate::items::us::SemanticUseEx;
-use crate::resolve::{ResolvedConcreteItem, ResolvedGenericItem, Resolver, ResolverData};
-use crate::substitution::{GenericSubstitution, SemanticRewriter};
-use crate::types::{ImplTypeId, add_type_based_diagnostics, get_impl_at_context, resolve_type};
+use crate::resolve::{
+    AsSegments, ResolutionContext, ResolvedConcreteItem, ResolvedGenericItem, Resolver,
+    ResolverData,
+};
+use crate::substitution::{self, GenericSubstitution, SemanticRewriter};
+use crate::types::{
+    self, ImplTypeId, ShallowGenericArg, TypeHead, add_type_based_diagnostics, get_impl_at_context,
+    maybe_resolve_shallow_generic_arg_type, resolve_type,
+};
 use crate::{
     Arenas, ConcreteFunction, ConcreteTraitId, ConcreteTraitLongId, FunctionId, FunctionLongId,
     GenericArgumentId, GenericParam, Mutability, SemanticDiagnostic, TypeId, TypeLongId, semantic,
@@ -562,6 +575,204 @@ pub fn impl_def_trait(db: &dyn SemanticGroup, impl_def_id: ImplDefId) -> Maybe<T
     resolve_trait_path(db, &mut diagnostics, &mut resolver, &trait_path_syntax)
 }
 
+/// Query implementation of [crate::db::SemanticGroup::impl_def_shallow_trait_generic_args].
+pub fn impl_def_shallow_trait_generic_args(
+    db: &dyn SemanticGroup,
+    impl_def_id: ImplDefId,
+) -> Maybe<Arc<[ShallowGenericArg]>> {
+    // println!("impl_def_trait_generic_args {:?}", impl_def_id.debug(db));
+    let module_file_id = impl_def_id.module_file_id(db);
+    let mut diagnostics = SemanticDiagnostics::default();
+
+    let impl_ast = db.module_impl_by_id(impl_def_id)?.to_maybe()?;
+    let inference_id = InferenceId::ImplDefTrait(impl_def_id);
+
+    let mut resolver = Resolver::new(db, module_file_id, inference_id);
+    resolver.set_feature_config(&impl_def_id, &impl_ast, &mut diagnostics);
+
+    if let OptionWrappedGenericParamList::WrappedGenericParamList(params_list) =
+        impl_ast.generic_params(db)
+    {
+        params_list.generic_params(db).elements(db).for_each(|param_syntax| {
+            let generic_param_id =
+                GenericParamLongId(module_file_id, param_syntax.stable_ptr(db)).intern(db);
+            resolver.add_generic_param(generic_param_id);
+        })
+    }
+
+    let trait_path_syntax = impl_ast.trait_path(db);
+
+    let elements = trait_path_syntax.segments(db).elements(db);
+    let Some(last) = elements.last() else {
+        return Ok(Arc::new([]));
+    };
+
+    match last {
+        ast::PathSegment::Simple(_) => Ok(Arc::new([])),
+        ast::PathSegment::WithGenericArgs(path_segment_with_generic_args) => Ok(Arc::from_iter(
+            path_segment_with_generic_args
+                .generic_args(db)
+                .generic_args(db)
+                .elements(db)
+                .filter_map(|generic_arg| {
+                    let value = match generic_arg {
+                        ast::GenericArg::Unnamed(generic_arg_unnamed) => {
+                            generic_arg_unnamed.value(db)
+                        }
+                        ast::GenericArg::Named(generic_arg_named) => generic_arg_named.value(db),
+                    };
+                    let GenericArgValue::Expr(expr) = value else {
+                        return None;
+                    };
+                    let x = maybe_resolve_shallow_generic_arg_type(
+                        db,
+                        &mut diagnostics,
+                        &mut resolver,
+                        &expr.expr(db),
+                    );
+                    x
+                }),
+        )),
+        ast::PathSegment::Missing(_) => Ok(Arc::new([])),
+    }
+}
+
+/// Query implementation of [crate::db::SemanticGroup::impl_def_trait].
+pub fn impl_alias_trait_generic_args(
+    db: &dyn SemanticGroup,
+    impl_alias_id: ImplAliasId,
+) -> Maybe<Arc<[ShallowGenericArg]>> {
+    // println!("impl_def_trait_generic_args {:?}", impl_def_id.debug(db));
+    let module_file_id = impl_alias_id.module_file_id(db);
+    let mut diagnostics = SemanticDiagnostics::default();
+
+    let impl_alias_ast = db.module_impl_alias_by_id(impl_alias_id)?.to_maybe()?;
+    let inference_id = InferenceId::ImplAliasImplDef(impl_alias_id);
+
+    let mut resolver = Resolver::new(db, module_file_id, inference_id);
+    resolver.set_feature_config(&impl_alias_id, &impl_alias_ast, &mut diagnostics);
+
+    if let OptionWrappedGenericParamList::WrappedGenericParamList(params_list) =
+        impl_alias_ast.generic_params(db)
+    {
+        params_list.generic_params(db).elements(db).for_each(|param_syntax| {
+            let generic_param_id =
+                GenericParamLongId(module_file_id, param_syntax.stable_ptr(db)).intern(db);
+            resolver.add_generic_param(generic_param_id);
+        })
+    }
+    let rhs_syntax = impl_alias_ast.impl_path(db);
+    let (shallow_args, generic_params) = match resolver.resolve_generic_path_with_args(
+        &mut diagnostics,
+        &rhs_syntax,
+        NotFoundItemType::Impl,
+        ResolutionContext::Default,
+    ) {
+        Ok(ResolvedGenericItem::Impl(impl_def_id)) => {
+            let shallow_args = db.impl_def_shallow_trait_generic_args(impl_def_id)?;
+            let OptionWrappedGenericParamList::WrappedGenericParamList(params) =
+                db.module_impl_by_id(impl_def_id)?.to_maybe()?.generic_params(db)
+            else {
+                return Ok(shallow_args);
+            };
+            (
+                shallow_args,
+                params
+                    .generic_params(db)
+                    .elements(db)
+                    .map(|param_syntax| {
+                        let generic_param_id = GenericParamLongId(
+                            impl_def_id.module_file_id(db),
+                            param_syntax.stable_ptr(db),
+                        )
+                        .intern(db);
+                        generic_param_id
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        }
+        Ok(ResolvedGenericItem::GenericImplAlias(impl_alias)) => {
+            let shallow_args = impl_alias_trait_generic_args(db, impl_alias)?;
+            let OptionWrappedGenericParamList::WrappedGenericParamList(params) =
+                db.module_impl_alias_by_id(impl_alias)?.to_maybe()?.generic_params(db)
+            else {
+                return Ok(shallow_args);
+            };
+            (
+                shallow_args,
+                params
+                    .generic_params(db)
+                    .elements(db)
+                    .map(|param_syntax| {
+                        let generic_param_id = GenericParamLongId(
+                            impl_alias.module_file_id(db),
+                            param_syntax.stable_ptr(db),
+                        )
+                        .intern(db);
+                        generic_param_id
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        }
+        _ => return Ok(Arc::new([])),
+    };
+
+    let elements = rhs_syntax.segments(db).elements(db);
+    let Some(last) = elements.last() else {
+        return Ok(Arc::new([]));
+    };
+
+    match last {
+        ast::PathSegment::Simple(_) => Ok(shallow_args),
+        ast::PathSegment::WithGenericArgs(path_segment_with_generic_args) => {
+            let generic_args =
+                path_segment_with_generic_args.generic_args(db).generic_args(db).elements_vec(db);
+            let arg_syntax_per_param = resolver.get_arg_syntax_per_param(
+                &mut diagnostics,
+                &generic_params,
+                &generic_args,
+            )?;
+
+            // for s in shallow_args.iter() {
+            //     if let ShallowGenericArg::GenericParameter(generic_arg) = s {
+            //         if let TypeLongId::GenericParameter(generic_param_id) =
+            // generic_arg.lookup_intern(db) {             println!(
+            //                 "impl_alias_trait_generic_args: {:?} -- {:?} -- {:?} {:?}",
+            //                 impl_alias_id.name(db),
+            //                 generic_param_id.debug_name(db),
+            //                 generic_params.first().unwrap().debug_name(db),
+            //                 arg_syntax_per_param.contains_key(&generic_param_id)
+
+            //             );
+            //         }
+            //     }
+            // }
+
+            Ok(Arc::from_iter(shallow_args.iter().filter_map(|arg| {
+                let ShallowGenericArg::GenericParameter(arg) = arg else {
+                    return Some(*arg);
+                };
+                let TypeLongId::GenericParameter(generic_param_id) = arg.lookup_intern(db) else {
+                    return None;
+                };
+                arg_syntax_per_param.get(&generic_param_id).and_then(|syntax| {
+                    let GenericArgValue::Expr(expr) = syntax else {
+                        return None;
+                    };
+                    let x = maybe_resolve_shallow_generic_arg_type(
+                        db,
+                        &mut diagnostics,
+                        &mut resolver,
+                        &expr.expr(db),
+                    );
+                    x
+                })
+            })))
+        }
+        ast::PathSegment::Missing(_) => Ok(Arc::new([])),
+    }
+}
+
 /// Query implementation of [crate::db::SemanticGroup::impl_concrete_trait].
 pub fn impl_concrete_trait(db: &dyn SemanticGroup, impl_id: ImplId) -> Maybe<ConcreteTraitId> {
     match impl_id.lookup_intern(db) {
@@ -616,7 +827,7 @@ pub fn priv_impl_declaration_data_inner(
     let mut diagnostics = SemanticDiagnostics::default();
 
     // TODO(spapini): when code changes in a file, all the AST items change (as they contain a path
-    // to the green root that changes. Once ASTs are rooted on items, use a selector that picks only
+    // to the green root that changes. Once ASTs are roo on items, use a selector that picks only
     // the item instead of all the module data.
     let impl_ast = db.module_impl_by_id(impl_def_id)?.to_maybe()?;
     let inference_id = InferenceId::LookupItemDeclaration(LookupItemId::ModuleItem(
@@ -806,6 +1017,7 @@ pub fn deref_chain_cycle(
     _db: &dyn SemanticGroup,
     _cycle: &salsa::Cycle,
     _ty: &TypeId,
+    _crate_id: &CrateId,
     _try_deref_mut: &bool,
 ) -> Maybe<DerefChain> {
     // `SemanticDiagnosticKind::DerefCycle` will be reported by `deref_impl_diagnostics`.
@@ -813,15 +1025,20 @@ pub fn deref_chain_cycle(
 }
 
 /// Query implementation of [crate::db::SemanticGroup::deref_chain].
-pub fn deref_chain(db: &dyn SemanticGroup, ty: TypeId, try_deref_mut: bool) -> Maybe<DerefChain> {
+pub fn deref_chain(
+    db: &dyn SemanticGroup,
+    ty: TypeId,
+    crate_id: CrateId,
+    try_deref_mut: bool,
+) -> Maybe<DerefChain> {
     let mut opt_deref = None;
     if try_deref_mut {
-        opt_deref = try_get_deref_func_and_target(db, ty, true)?;
+        opt_deref = try_get_deref_func_and_target(db, ty, crate_id, true)?;
     }
     let self_mutability = if opt_deref.is_some() {
         Mutability::Reference
     } else {
-        opt_deref = try_get_deref_func_and_target(db, ty, false)?;
+        opt_deref = try_get_deref_func_and_target(db, ty, crate_id, false)?;
         Mutability::Immutable
     };
 
@@ -829,7 +1046,7 @@ pub fn deref_chain(db: &dyn SemanticGroup, ty: TypeId, try_deref_mut: bool) -> M
         return Ok(DerefChain { derefs: Arc::new([]) });
     };
 
-    let inner_chain = db.deref_chain(target_ty, false)?;
+    let inner_chain = db.deref_chain(target_ty, crate_id, false)?;
 
     Ok(DerefChain {
         derefs: chain!(
@@ -844,6 +1061,7 @@ pub fn deref_chain(db: &dyn SemanticGroup, ty: TypeId, try_deref_mut: bool) -> M
 fn try_get_deref_func_and_target(
     db: &dyn SemanticGroup,
     ty: TypeId,
+    crate_id: CrateId,
     is_mut_deref: bool,
 ) -> Result<Option<(FunctionId, TypeId)>, DiagnosticAdded> {
     let info = db.core_info();
@@ -853,14 +1071,15 @@ fn try_get_deref_func_and_target(
         (info.deref_trt, info.deref_fn)
     };
 
-    let mut lookup_context = ImplLookupContext::new(deref_trait_id.module_file_id(db).0, vec![]);
+    let mut lookup_context = ImplLookupContext::default(crate_id);
     enrich_lookup_context_with_ty(db, ty, &mut lookup_context);
     let concrete_trait = ConcreteTraitLongId {
         trait_id: deref_trait_id,
         generic_args: vec![GenericArgumentId::Type(ty)],
     }
     .intern(db);
-    let Ok(deref_impl) = get_impl_at_context(db, lookup_context, concrete_trait, None) else {
+    let Ok(deref_impl) = get_impl_at_context(db, lookup_context.intern(db), concrete_trait, None)
+    else {
         return Ok(None);
     };
     let concrete_impl_id = match deref_impl.lookup_intern(db) {
@@ -985,8 +1204,8 @@ fn get_impl_based_on_single_impl_type(
     let generic_params = db.impl_def_generic_params(impl_def_id).unwrap();
     let generic_params_ids =
         generic_params.iter().map(|generic_param| generic_param.id()).collect();
-    let lookup_context = ImplLookupContext::new(module_file_id.0, generic_params_ids);
-    get_impl_at_context(db, lookup_context, concrete_trait_id(ty), None)
+    let lookup_context = ImplLookupContext::new(module_file_id.0, generic_params_ids, db);
+    get_impl_at_context(db, lookup_context.intern(db), concrete_trait_id(ty), None)
         .map_err(|err| (err, *impl_item_type_id))
 }
 
@@ -1220,7 +1439,8 @@ pub fn priv_impl_definition_data(
 
     let generic_params_ids =
         generic_params.iter().map(|generic_param| generic_param.id()).collect();
-    let lookup_context = ImplLookupContext::new(module_file_id.0, generic_params_ids);
+    let lookup_context =
+        ImplLookupContext::new(module_file_id.0, generic_params_ids, db).intern(db);
     check_special_impls(
         db,
         &mut diagnostics,
@@ -1409,7 +1629,7 @@ fn report_invalid_impl_item<Terminal: syntax::node::Terminal>(
 fn check_special_impls(
     db: &dyn SemanticGroup,
     diagnostics: &mut SemanticDiagnostics,
-    lookup_context: ImplLookupContext,
+    lookup_context: ImplLookupContextId,
     concrete_trait: ConcreteTraitId,
     stable_ptr: SyntaxStablePtrId,
 ) -> Maybe<()> {
@@ -1422,7 +1642,7 @@ fn check_special_impls(
         let tys = get_inner_types(db, extract_matches!(generic_args[0], GenericArgumentId::Type))?;
         for inference_error in tys
             .into_iter()
-            .map(|ty| db.type_info(lookup_context.clone(), ty))
+            .map(|ty| db.type_info(lookup_context, ty))
             .flat_map(|info| info.copyable.err())
         {
             if matches!(
@@ -1439,7 +1659,7 @@ fn check_special_impls(
         let tys = get_inner_types(db, extract_matches!(generic_args[0], GenericArgumentId::Type))?;
         for inference_error in tys
             .into_iter()
-            .map(|ty| db.type_info(lookup_context.clone(), ty))
+            .map(|ty| db.type_info(lookup_context, ty))
             .flat_map(|info| info.droppable.err())
         {
             if matches!(
@@ -1521,75 +1741,39 @@ pub enum GenericsHeadFilter {
     NoGenerics,
 }
 
-/// Query implementation of [crate::db::SemanticGroup::module_impl_ids_for_trait_filter].
-pub fn module_impl_ids_for_trait_filter(
-    db: &dyn SemanticGroup,
-    module_id: ModuleId,
-    trait_filter: TraitFilter,
-) -> Maybe<Vec<UninferredImpl>> {
-    // Get the impls first from the module, do not change this order.
-    let mut uninferred_impls: OrderedHashSet<UninferredImpl> =
-        OrderedHashSet::from_iter(module_impl_ids(db, module_id, module_id)?);
-    for (user_module, containing_module) in &db.priv_module_use_star_modules(module_id).accessible {
-        if let Ok(star_module_uninferred_impls) =
-            module_impl_ids(db, *user_module, *containing_module)
-        {
-            uninferred_impls.extend(star_module_uninferred_impls);
-        }
-    }
-    let mut res = Vec::new();
-    for uninferred_impl in uninferred_impls {
-        let Ok(trait_id) = uninferred_impl.trait_id(db) else { continue };
-        if trait_id != trait_filter.trait_id {
-            continue;
-        }
-        let Ok(concrete_trait_id) = uninferred_impl.concrete_trait(db) else {
-            continue;
-        };
-        if let Ok(true) = concrete_trait_fits_trait_filter(db, concrete_trait_id, &trait_filter) {
-            res.push(uninferred_impl);
-        }
-    }
-    Ok(res)
-}
-
 /// Returns the uninferred impls in a module.
 fn module_impl_ids(
     db: &dyn SemanticGroup,
     user_module: ModuleId,
     containing_module: ModuleId,
-) -> Maybe<Vec<UninferredImpl>> {
-    let mut uninferred_impls = Vec::new();
-    for item in db.priv_module_semantic_data(containing_module)?.items.values() {
-        if !matches!(
-            item.item_id,
-            ModuleItemId::Impl(_) | ModuleItemId::ImplAlias(_) | ModuleItemId::Use(_)
-        ) {
-            continue;
-        }
-        if !peek_visible_in(db, item.visibility, containing_module, user_module) {
-            continue;
-        }
-        match item.item_id {
-            ModuleItemId::Impl(impl_def_id) => {
-                uninferred_impls.push(UninferredImpl::Def(impl_def_id));
-            }
+) -> Maybe<BTreeSet<UninferredImplById>> {
+    Ok(db
+        .priv_module_semantic_data(containing_module)?
+        .items
+        .values()
+        .filter(|item| {
+            matches!(
+                item.item_id,
+                ModuleItemId::Impl(_) | ModuleItemId::ImplAlias(_) | ModuleItemId::Use(_)
+            ) && peek_visible_in(db.upcast(), item.visibility, containing_module, user_module)
+        })
+        .filter_map(|item| match item.item_id {
+            ModuleItemId::Impl(impl_def_id) => Some(UninferredImpl::Def(impl_def_id).into()),
             ModuleItemId::ImplAlias(impl_alias_id) => {
-                uninferred_impls.push(UninferredImpl::ImplAlias(impl_alias_id));
+                Some(UninferredImpl::ImplAlias(impl_alias_id).into())
             }
             ModuleItemId::Use(use_id) => match db.use_resolved_item(use_id) {
                 Ok(ResolvedGenericItem::Impl(impl_def_id)) => {
-                    uninferred_impls.push(UninferredImpl::Def(impl_def_id));
+                    Some(UninferredImpl::Def(impl_def_id).into())
                 }
                 Ok(ResolvedGenericItem::GenericImplAlias(impl_alias_id)) => {
-                    uninferred_impls.push(UninferredImpl::ImplAlias(impl_alias_id));
+                    Some(UninferredImpl::ImplAlias(impl_alias_id).into())
                 }
-                _ => {}
+                _ => None,
             },
-            _ => {}
-        }
-    }
-    Ok(uninferred_impls)
+            _ => None,
+        })
+        .collect())
 }
 
 /// Cycle handling for [crate::db::SemanticGroup::module_impl_ids_for_trait_filter].
@@ -1652,9 +1836,6 @@ fn concrete_trait_fits_trait_filter(
     concrete_trait_id: ConcreteTraitId,
     trait_filter: &TraitFilter,
 ) -> Maybe<bool> {
-    if trait_filter.trait_id != concrete_trait_id.trait_id(db) {
-        return Ok(false);
-    }
     let generic_args = concrete_trait_id.generic_args(db);
     let first_generic = generic_args.first();
     Ok(match &trait_filter.generics_filter {
@@ -1673,80 +1854,257 @@ fn concrete_trait_fits_trait_filter(
 }
 
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
-pub enum ImplOrModuleById {
-    Impl(ImplId),
-    Module(ModuleId),
-}
-impl From<ImplId> for ImplOrModuleById {
-    fn from(impl_id: ImplId) -> Self {
-        ImplOrModuleById::Impl(impl_id)
-    }
-}
-impl From<ModuleId> for ImplOrModuleById {
-    fn from(module_id: ModuleId) -> Self {
-        ImplOrModuleById::Module(module_id)
-    }
-}
-
-impl Ord for ImplOrModuleById {
+pub struct UninferredImplById(pub UninferredImpl);
+impl Ord for UninferredImplById {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        match (self, other) {
-            (ImplOrModuleById::Impl(imp), ImplOrModuleById::Impl(other_impl)) => {
-                imp.get_internal_id().cmp(other_impl.get_internal_id())
+        match (&self.0, &other.0) {
+            (UninferredImpl::Def(impl_def_id), UninferredImpl::Def(other_impl_def_id)) => {
+                impl_def_id.get_internal_id().cmp(other_impl_def_id.get_internal_id())
             }
-            (ImplOrModuleById::Module(module), ImplOrModuleById::Module(other_module)) => {
-                match (module, other_module) {
-                    (ModuleId::CrateRoot(crate_id), ModuleId::CrateRoot(other_crate_id)) => {
-                        crate_id.get_internal_id().cmp(other_crate_id.get_internal_id())
-                    }
-                    (ModuleId::CrateRoot(_), ModuleId::Submodule(_)) => std::cmp::Ordering::Less,
-                    (ModuleId::Submodule(_), ModuleId::CrateRoot(_)) => std::cmp::Ordering::Greater,
-                    (ModuleId::Submodule(module_id), ModuleId::Submodule(other_module_id)) => {
-                        module_id.get_internal_id().cmp(other_module_id.get_internal_id())
-                    }
+            (
+                UninferredImpl::ImplAlias(impl_alias_id),
+                UninferredImpl::ImplAlias(other_impl_alias_id),
+            ) => impl_alias_id.get_internal_id().cmp(other_impl_alias_id.get_internal_id()),
+            (UninferredImpl::GenericParam(param), UninferredImpl::GenericParam(other_param)) => {
+                param.get_internal_id().cmp(other_param.get_internal_id())
+            }
+            (
+                UninferredImpl::ImplImpl(impl_impl_id),
+                UninferredImpl::ImplImpl(other_impl_impl_id),
+            ) => {
+                if impl_impl_id.impl_id() == other_impl_impl_id.impl_id() {
+                    impl_impl_id
+                        .trait_impl_id()
+                        .get_internal_id()
+                        .cmp(other_impl_impl_id.trait_impl_id().get_internal_id())
+                } else {
+                    impl_impl_id
+                        .impl_id()
+                        .get_internal_id()
+                        .cmp(other_impl_impl_id.impl_id().get_internal_id())
                 }
             }
-            (ImplOrModuleById::Impl(_), ImplOrModuleById::Module(_)) => std::cmp::Ordering::Less,
-            (ImplOrModuleById::Module(_), ImplOrModuleById::Impl(_)) => std::cmp::Ordering::Greater,
+            (
+                UninferredImpl::GeneratedImpl(generated_impl),
+                UninferredImpl::GeneratedImpl(other_generated_impl),
+            ) => generated_impl.get_internal_id().cmp(other_generated_impl.get_internal_id()),
+            (UninferredImpl::Def(_), _) => std::cmp::Ordering::Less,
+            (_, UninferredImpl::Def(_)) => std::cmp::Ordering::Greater,
+            (UninferredImpl::ImplAlias(_), _) => std::cmp::Ordering::Less,
+            (_, UninferredImpl::ImplAlias(_)) => std::cmp::Ordering::Greater,
+            (UninferredImpl::GenericParam(_), _) => std::cmp::Ordering::Less,
+            (_, UninferredImpl::GenericParam(_)) => std::cmp::Ordering::Greater,
+            (UninferredImpl::ImplImpl(_), _) => std::cmp::Ordering::Less,
+            (_, UninferredImpl::ImplImpl(_)) => std::cmp::Ordering::Greater,
         }
     }
 }
-impl PartialOrd for ImplOrModuleById {
+impl PartialOrd for UninferredImplById {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
+impl From<UninferredImpl> for UninferredImplById {
+    fn from(uninferred_impl: UninferredImpl) -> Self {
+        UninferredImplById(uninferred_impl)
+    }
+}
 
-#[derive(Clone, Debug, Default, Hash, PartialEq, Eq, DebugWithDb)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, DebugWithDb)]
 #[debug_db(dyn SemanticGroup + 'static)]
 pub struct ImplLookupContext {
-    pub modules_and_impls: BTreeSet<ImplOrModuleById>,
+    pub crate_id: CrateId,
     pub generic_params: Vec<GenericParamId>,
+    pub inner_impls: BTreeSet<UninferredImplById>,
 }
+
+define_short_id!(
+    ImplLookupContextId,
+    ImplLookupContext,
+    SemanticGroup,
+    lookup_intern_impl_lookup_context,
+    intern_impl_lookup_context
+);
+
 impl ImplLookupContext {
-    pub fn new(module_id: ModuleId, generic_params: Vec<GenericParamId>) -> ImplLookupContext {
-        Self { modules_and_impls: [ImplOrModuleById::Module(module_id)].into(), generic_params }
+    pub fn default(crate_id: CrateId) -> Self {
+        Self { crate_id, generic_params: Default::default(), inner_impls: Default::default() }
     }
-    pub fn insert_lookup_scope(&mut self, db: &dyn SemanticGroup, imp: &UninferredImpl) {
-        let item = match imp {
-            UninferredImpl::Def(impl_def_id) => impl_def_id.module_file_id(db).0.into(),
-            UninferredImpl::ImplAlias(impl_alias_id) => impl_alias_id.module_file_id(db).0.into(),
-            UninferredImpl::GenericParam(param) => param.module_file_id(db).0.into(),
-            UninferredImpl::ImplImpl(impl_impl_id) => impl_impl_id.impl_id.into(),
+    pub fn new(
+        module_id: ModuleId,
+        generic_params: Vec<GenericParamId>,
+        db: &dyn SemanticGroup,
+    ) -> ImplLookupContext {
+        let crate_id = module_id.owning_crate(db);
+        let generic_params = generic_params
+            .iter()
+            .filter(|generic_param_id| {
+                if !matches!(generic_param_id.kind(db.upcast()), GenericKind::Impl) {
+                    return false;
+                }
+
+                let uninferred_impl = UninferredImpl::GenericParam(**generic_param_id);
+
+                let Ok(global_impls) = db.crate_global_impls(crate_id) else {
+                    return true;
+                };
+                let Ok(trait_id) = uninferred_impl.trait_id(db) else {
+                    return true;
+                };
+                let Some(set) = global_impls.get(&trait_id) else {
+                    return true;
+                };
+                let uninferred_impl: UninferredImplById = uninferred_impl.into();
+                if set.contains(&uninferred_impl) {
+                    return false;
+                };
+                true
+            })
+            .copied()
+            .collect_vec();
+        let mut res = Self {
+            crate_id,
+            generic_params: generic_params
+                .clone()
+                .into_iter()
+                .filter(|id| id.lookup_intern(db).has_type_constraints_syntax(db))
+                .collect_vec(),
+            inner_impls: BTreeSet::from_iter(
+                generic_params.into_iter().map(|id| UninferredImpl::GenericParam(id).into()),
+            ),
+        };
+        res.insert_module(module_id, db);
+        res
+    }
+    fn insert_lookup_scope(&mut self, db: &dyn SemanticGroup, imp: &UninferredImpl) {
+        let defs_db = db.upcast();
+        match imp {
+            UninferredImpl::Def(impl_def_id) => {
+                self.insert_module(impl_def_id.module_file_id(defs_db).0, db)
+            }
+            UninferredImpl::ImplAlias(impl_alias_id) => {
+                self.insert_module(impl_alias_id.module_file_id(defs_db).0, db)
+            }
+            UninferredImpl::GenericParam(param) => {
+                self.insert_module(param.module_file_id(defs_db).0, db)
+            }
+            UninferredImpl::ImplImpl(impl_impl_id) => self.insert_impl(impl_impl_id.impl_id, db),
             UninferredImpl::GeneratedImpl(_) => {
                 // GeneratedImpls do not extend the lookup context.
-                return;
             }
         };
-        self.modules_and_impls.insert(item);
     }
-    pub fn insert_module(&mut self, module_id: ModuleId) -> bool {
-        self.modules_and_impls.insert(ImplOrModuleById::Module(module_id))
+    pub fn insert_module(&mut self, module_id: ModuleId, db: &dyn SemanticGroup) {
+        // if self.is_first_phase {
+        //     return;
+        // }
+        // let mut module_impls = module_impl_ids(db, module_id, module_id).unwrap();
+
+        // if module_impls.len() < self.inner_impls.len() {
+        //     self.inner_impls.extend(module_impls);
+        // } else {
+        //     for imp in self.inner_impls.iter() {
+        //         module_impls.insert(*imp);
+        //     }
+        //     self.inner_impls = module_impls;
+        // }
+        // for (user_module, containing_module) in
+        //     &db.priv_module_use_star_modules(module_id).accessible
+        // {
+        //     if let Ok(mut star_module_uninferred_impls) =
+        //         module_impl_ids(db, *user_module, *containing_module)
+        //     {
+        //         if star_module_uninferred_impls.len() < self.inner_impls.len() {
+        //             self.inner_impls.extend(star_module_uninferred_impls);
+        //         } else {
+        //             for imp in self.inner_impls.iter() {
+        //                 star_module_uninferred_impls.insert(*imp);
+        //             }
+        //             self.inner_impls = star_module_uninferred_impls;
+        //         }
+        //     }
+        // }
+        let crate_global_impls = db.crate_global_impls(self.crate_id).unwrap_or_default();
+        if let Ok(module_impls) = db.module_global_impls(module_id) {
+            module_impls.locals.iter().for_each(|imp| {
+                if let Ok(trait_id) = imp.0.trait_id(db) {
+                    if let Some(set) = crate_global_impls.get(&trait_id) {
+                        if set.contains(imp) {
+                            return;
+                        }
+                    }
+                }
+
+                self.inner_impls.insert(*imp);
+            });
+            if let Ok(x) = db.crate_dependancies(self.crate_id) {
+                if !x.contains(&module_id.owning_crate(db)) {
+                    module_impls.globals_by_trait.iter().for_each(|(_, imps)| {
+                        imps.iter().for_each(|imp| {
+                            if let Ok(trait_id) = imp.0.trait_id(db) {
+                                if let Some(set) = crate_global_impls.get(&trait_id) {
+                                    if set.contains(imp) {
+                                        return;
+                                    }
+                                }
+                            }
+
+                            self.inner_impls.insert(*imp);
+                        });
+                    });
+                }
+            }
+        }
     }
 
-    pub fn insert_impl(&mut self, impl_id: ImplId) -> bool {
-        self.modules_and_impls.insert(ImplOrModuleById::Impl(impl_id))
+    pub fn insert_impl(&mut self, impl_id: ImplId, db: &dyn SemanticGroup) {
+        let mut uninferred_impls = Vec::new();
+        for (_, trait_impl_id) in
+            db.trait_impls(impl_id.concrete_trait(db).unwrap().trait_id(db)).unwrap().iter()
+        {
+            uninferred_impls.push(UninferredImpl::ImplImpl(ImplImplId::new(
+                impl_id,
+                *trait_impl_id,
+                db,
+            )));
+        }
+        for uninferred_impl in uninferred_impls {
+            self.inner_impls.insert(uninferred_impl.into());
+        }
     }
+    pub fn strip_for_trait_id(&mut self, db: &dyn SemanticGroup, trait_id: TraitId) {
+        let deps = db.reachable_trait_depandancies(trait_id, self.crate_id);
+        let type_eq_trt = db.core_info().type_eq_trt;
+        self.inner_impls.retain(|impl_by_id| {
+            if let Ok(impl_trait_id) = impl_by_id.0.trait_id(db) {
+                return trait_id == impl_trait_id
+                    || trait_id == type_eq_trt
+                    || deps.contains(&impl_trait_id);
+            }
+
+            false
+        });
+    }
+}
+
+pub fn impl_lookup_context_insert_lookup_scope(
+    db: &dyn SemanticGroup,
+    impl_lookup_context_id: ImplLookupContextId,
+    uninferred_impl: UninferredImpl,
+) -> ImplLookupContextId {
+    let mut impl_lookup_context = impl_lookup_context_id.lookup_intern(db);
+    impl_lookup_context.insert_lookup_scope(db, &uninferred_impl);
+    impl_lookup_context.intern(db)
+}
+
+pub fn impl_lookup_context_insert_module(
+    db: &dyn SemanticGroup,
+    impl_lookup_context_id: ImplLookupContextId,
+    module_id: ModuleId,
+) -> ImplLookupContextId {
+    let mut impl_lookup_context = impl_lookup_context_id.lookup_intern(db);
+    impl_lookup_context.insert_module(module_id, db);
+    impl_lookup_context.intern(db)
 }
 
 /// A candidate impl for later inference.
@@ -1783,11 +2141,7 @@ impl UninferredImpl {
                 let impl_def_id = db.impl_alias_impl_def(*impl_alias_id)?;
                 db.impl_def_trait(impl_def_id)
             }
-            UninferredImpl::GenericParam(param) => {
-                let param =
-                    extract_matches!(db.generic_param_semantic(*param)?, GenericParam::Impl);
-                param.concrete_trait.map(|concrete_trait| concrete_trait.trait_id(db))
-            }
+            UninferredImpl::GenericParam(param) => db.generic_impl_param_trait(*param),
             UninferredImpl::ImplImpl(impl_impl_id) => db
                 .impl_impl_concrete_trait(*impl_impl_id)
                 .map(|concrete_trait| concrete_trait.trait_id(db)),
@@ -1795,15 +2149,17 @@ impl UninferredImpl {
         }
     }
 
-    pub fn lookup_scope(&self, db: &dyn SemanticGroup) -> ImplOrModuleById {
+    fn trait_shallow_generic_args(
+        &self,
+        db: &dyn SemanticGroup,
+    ) -> Maybe<Arc<[ShallowGenericArg]>> {
         match self {
-            UninferredImpl::Def(impl_def_id) => impl_def_id.module_file_id(db).0.into(),
-            UninferredImpl::ImplAlias(impl_alias_id) => impl_alias_id.module_file_id(db).0.into(),
-            UninferredImpl::GenericParam(param) => param.module_file_id(db).0.into(),
-            UninferredImpl::ImplImpl(impl_impl_id) => impl_impl_id.impl_id.into(),
-            UninferredImpl::GeneratedImpl(generated_impl) => {
-                generated_impl.concrete_trait(db).trait_id(db).module_file_id(db).0.into()
-            }
+            UninferredImpl::Def(impl_def_id) => db.impl_def_shallow_trait_generic_args(*impl_def_id),
+            
+            UninferredImpl::ImplAlias(impl_alias_id) => db.impl_alias_trait_generic_args(*impl_alias_id),
+            UninferredImpl::GenericParam(param) => Ok(Arc::new([])),
+            UninferredImpl::ImplImpl(impl_impl_id) => Ok(Arc::new([])),
+            UninferredImpl::GeneratedImpl(generated_impl) => Ok(Arc::new([])),
         }
     }
 }
@@ -1830,6 +2186,11 @@ define_short_id!(
     lookup_intern_uninferred_generated_impl,
     intern_uninferred_generated_impl
 );
+impl UnstableSalsaId for UninferredGeneratedImplId {
+    fn get_internal_id(&self) -> &salsa::InternId {
+        &self.0
+    }
+}
 semantic_object_for_id!(
     UninferredGeneratedImplId,
     lookup_intern_uninferred_generated_impl,
@@ -1865,51 +2226,79 @@ impl DebugWithDb<dyn SemanticGroup> for UninferredGeneratedImplLongId {
     }
 }
 
+pub fn trait_candidate_by_head(
+    db: &dyn SemanticGroup,
+    crate_id: CrateId,
+    trait_id: TraitId,
+) -> Arc<OrderedHashMap<GenericsHeadFilter, OrderedHashSet<UninferredImplById>>> {
+    let mut res: OrderedHashMap<GenericsHeadFilter, OrderedHashSet<UninferredImplById>> =
+        OrderedHashMap::default();
+    let impls = db.crate_global_impls(crate_id).unwrap_or_default();
+    if let Some(candidates) = impls.get(&trait_id) {
+        for candidate in candidates.iter() {
+            let Ok(concrete_trait) = candidate.0.concrete_trait(db) else {
+                continue;
+            };
+            let generic_args = concrete_trait.generic_args(db);
+            if generic_args.is_empty() {
+                res.entry(GenericsHeadFilter::NoGenerics).or_default().insert(*candidate);
+            } else if let Some(first_generic_head) = generic_args[0].head(db) {
+                if !matches!(candidate.0, UninferredImpl::GenericParam(_)) {
+                    if let GenericArgumentHead::Type(mut type_head) = first_generic_head.clone() {
+                        while let TypeHead::Snapshot(inner) = type_head {
+                            type_head = *inner;
+                        }
+                        if matches!(type_head, TypeHead::Generic(_)) {
+                            res.entry(GenericsHeadFilter::NoFilter).or_default().insert(*candidate);
+                            continue;
+                        }
+                    };
+                }
+                res.entry(GenericsHeadFilter::FirstGenericFilter(first_generic_head))
+                    .or_default()
+                    .insert(*candidate);
+            } else {
+                res.entry(GenericsHeadFilter::NoFilter).or_default().insert(*candidate);
+            }
+        }
+    }
+    res.into()
+}
+
 /// Finds all the implementations of a concrete trait, in a specific lookup context.
 pub fn find_candidates_at_context(
     db: &dyn SemanticGroup,
-    lookup_context: &ImplLookupContext,
-    filter: &TraitFilter,
-) -> Maybe<OrderedHashSet<UninferredImpl>> {
+    lookup_context: ImplLookupContextId,
+    filter: TraitFilter,
+) -> Maybe<OrderedHashSet<UninferredImplById>> {
     let mut res = OrderedHashSet::default();
-    for generic_param_id in &lookup_context.generic_params {
-        if !matches!(generic_param_id.kind(db), GenericKind::Impl) {
-            continue;
-        };
-        let Ok(trait_id) = db.generic_impl_param_trait(*generic_param_id) else {
-            continue;
-        };
-        if filter.trait_id != trait_id {
-            continue;
+    let lookup = lookup_context.lookup_intern(db);
+    let crate_id = lookup.crate_id;
+    let locals = lookup.inner_impls.into_iter().filter(|uninferred_impl| {
+        let Ok(trait_id) = uninferred_impl.0.trait_id(db) else { return false };
+        trait_id == filter.trait_id
+    });
+    match filter.generics_filter {
+        GenericsHeadFilter::NoFilter => {
+            let c = db.crate_global_impls(crate_id)?;
+            let c = c.get(&filter.trait_id);
+            res.extend(locals);
+            res.extend(c.into_iter().flat_map(|s| s.clone().into_iter()))
         }
-        let Ok(generic_param_semantic) = db.generic_param_semantic(*generic_param_id) else {
-            continue;
-        };
-        let param = extract_matches!(generic_param_semantic, GenericParam::Impl);
-        let Ok(imp_concrete_trait_id) = param.concrete_trait else { continue };
-        let Ok(trait_fits_filter) =
-            concrete_trait_fits_trait_filter(db, imp_concrete_trait_id, filter)
-        else {
-            continue;
-        };
-        if !trait_fits_filter {
-            continue;
-        }
-        res.insert(UninferredImpl::GenericParam(*generic_param_id));
-    }
-    for module_or_impl_id in &lookup_context.modules_and_impls {
-        let Ok(imps) = (match module_or_impl_id {
-            ImplOrModuleById::Module(module_id) => {
-                db.module_impl_ids_for_trait_filter(*module_id, filter.clone())
-            }
-            ImplOrModuleById::Impl(impl_id) => {
-                db.impl_impl_ids_for_trait_filter(*impl_id, filter.clone())
-            }
-        }) else {
-            continue;
-        };
-        for imp in imps {
-            res.insert(imp);
+        _ => {
+            let q = db.trait_candidate_by_head(crate_id, filter.trait_id);
+            let c1 = q.get(&filter.generics_filter).cloned();
+            let c2 = q.get(&GenericsHeadFilter::NoFilter).cloned();
+            res.extend(c1.into_iter().flat_map(|s| s.into_iter()));
+            res.extend(c2.into_iter().flat_map(|s| s.into_iter()));
+            res.extend(locals.filter(|uninferred_impl| {
+                if filter.trait_id.name(db).contains("erde") {
+                let Ok(concrete_trait_id) = uninferred_impl.0.concrete_trait(db) else {
+                    return false;
+                };
+                let x =concrete_trait_fits_trait_filter(db, concrete_trait_id, &filter) == Ok(true);
+                true
+            }));
         }
     }
     Ok(res)
@@ -2049,7 +2438,7 @@ pub fn can_infer_impl_by_self(
     let Some((concrete_trait_id, _)) = temp_inference.infer_concrete_trait_by_self(
         trait_function_id,
         self_ty,
-        &lookup_context,
+        lookup_context,
         Some(stable_ptr),
         |err| inference_errors.push((trait_function_id, err)),
     ) else {
@@ -2065,7 +2454,7 @@ pub fn can_infer_impl_by_self(
     match temp_inference.trait_solution_set(
         concrete_trait_id,
         ImplVarTraitItemMappings::default(),
-        lookup_context.clone(),
+        lookup_context.lookup_intern(ctx.db),
     ) {
         Ok(SolutionSet::Unique(_) | SolutionSet::Ambiguous(_)) => true,
         Ok(SolutionSet::None) => {
@@ -2099,7 +2488,7 @@ pub fn infer_impl_by_self(
         .infer_concrete_trait_by_self(
             trait_function_id,
             self_ty,
-            &lookup_context,
+            lookup_context,
             Some(stable_ptr),
             |_| {},
         )
@@ -2115,7 +2504,7 @@ pub fn infer_impl_by_self(
     let inference = &mut ctx.resolver.inference();
     let generic_function = inference.infer_trait_generic_function(
         concrete_trait_function_id,
-        &impl_lookup_context,
+        impl_lookup_context,
         Some(stable_ptr),
     );
     let generic_args = ctx.resolver.resolve_generic_args(
@@ -3607,4 +3996,483 @@ pub fn priv_impl_is_fully_concrete(db: &dyn SemanticGroup, impl_id: ImplId) -> b
 
 pub fn priv_impl_is_var_free(db: &dyn SemanticGroup, impl_id: ImplId) -> bool {
     impl_id.lookup_intern(db).is_var_free(db)
+}
+
+pub fn crate_dependancies(
+    db: &dyn SemanticGroup,
+    crate_id: CrateId,
+) -> Maybe<Arc<UnorderedHashSet<CrateId>>> {
+    let mut crates = [crate_id, db.core_crate()].into_iter().unique().collect_vec();
+    let mut crates_set: UnorderedHashSet<CrateId, _> = UnorderedHashSet::<
+        CrateId,
+        std::collections::hash_map::RandomState,
+    >::from_iter(crates.iter().copied());
+    // println!("crate_global_impls {:?}",crate_id.debug(db));
+    while let Some(crate_id) = crates.pop() {
+        // println!("crate_global_implsinner {:?}",crate_id.debug(db));
+        let settings = db.crate_config(crate_id).map(|c| c.settings).unwrap_or_default();
+
+        for (ident, dep) in settings.dependencies {
+            let dep_crate_id =
+                CrateLongId::Real { name: ident.into(), discriminator: dep.discriminator.clone() }
+                    .intern(db);
+            if !crates_set.contains(&dep_crate_id) {
+                crates.push(dep_crate_id);
+                crates_set.insert(dep_crate_id);
+            }
+        }
+    }
+    Ok(crates_set.into())
+}
+
+pub fn crate_global_impls(
+    db: &dyn SemanticGroup,
+    crate_id: CrateId,
+) -> Maybe<Arc<UnorderedHashMap<TraitId, OrderedHashSet<UninferredImplById>>>> {
+    // println!("impls for crate {:?}", crate_id);
+    let mut crate_global_impls: UnorderedHashMap<TraitId, OrderedHashSet<UninferredImplById>> =
+        UnorderedHashMap::default();
+    let mut crates = [crate_id, db.core_crate()].into_iter().unique().collect_vec();
+    let mut crates_set: UnorderedHashSet<CrateId, _> = UnorderedHashSet::<
+        CrateId,
+        std::collections::hash_map::RandomState,
+    >::from_iter(crates.iter().copied());
+    // println!("crate_global_impls {:?}",crate_id.debug(db));
+    while let Some(crate_id) = crates.pop() {
+        // println!("crate_global_implsinner {:?}",crate_id.debug(db));
+        let settings = db.crate_config(crate_id).map(|c| c.settings).unwrap_or_default();
+
+        for (ident, dep) in settings.dependencies {
+            let dep_crate_id =
+                CrateLongId::Real { name: ident.into(), discriminator: dep.discriminator.clone() }
+                    .intern(db);
+            if !crates_set.contains(&dep_crate_id) {
+                crates.push(dep_crate_id);
+                crates_set.insert(dep_crate_id);
+            }
+        }
+
+        let mut modules = vec![ModuleId::CrateRoot(crate_id)];
+        while let Some(module_id) = modules.pop() {
+            if let Ok(module_impls) = db.module_global_impls(module_id) {
+                for (trait_id, impls) in module_impls.globals_by_trait.iter() {
+                    crate_global_impls.entry(*trait_id).or_default().extend(impls.clone());
+                }
+            }
+            if let Ok(x) = db.module_submodules_ids(module_id) {
+                modules.extend(x.iter().map(|sub_module| ModuleId::Submodule(*sub_module)));
+            }
+        }
+    }
+
+    Ok(crate_global_impls.into())
+}
+
+pub fn crate_traits_dependancies(
+    db: &dyn SemanticGroup,
+    crate_id: CrateId,
+) -> Arc<UnorderedHashMap<TraitId, OrderedHashSet<TraitId>>> {
+    // println!("impls for crate {:?}", crate_id);
+    let mut depandancies: UnorderedHashMap<TraitId, OrderedHashSet<TraitId>> =
+        UnorderedHashMap::default();
+    let mut crates = [crate_id, db.core_crate()].into_iter().unique().collect_vec();
+    let mut crates_set: UnorderedHashSet<CrateId, _> = UnorderedHashSet::<
+        CrateId,
+        std::collections::hash_map::RandomState,
+    >::from_iter(crates.iter().copied());
+    while let Some(crate_id) = crates.pop() {
+        let settings = db.crate_config(crate_id).map(|c| c.settings).unwrap_or_default();
+
+        for (ident, dep) in settings.dependencies {
+            let dep_crate_id =
+                CrateLongId::Real { name: ident.into(), discriminator: dep.discriminator.clone() }
+                    .intern(db);
+            if !crates_set.contains(&dep_crate_id) {
+                crates.push(dep_crate_id);
+                crates_set.insert(dep_crate_id);
+            }
+        }
+
+        let mut modules = vec![ModuleId::CrateRoot(crate_id)];
+        while let Some(module_id) = modules.pop() {
+            if let Ok(module_impls) = db.module_global_impls(module_id) {
+                for (trait_id, impls) in module_impls.trait_deps.iter() {
+                    depandancies.entry(*trait_id).or_default().extend(impls.clone());
+                }
+            }
+            if let Ok(x) = db.module_submodules_ids(module_id) {
+                modules.extend(x.iter().map(|sub_module| ModuleId::Submodule(*sub_module)));
+            }
+        }
+    }
+
+    depandancies.into()
+}
+
+pub fn reachable_trait_depandancies(
+    db: &dyn SemanticGroup,
+    trait_id: TraitId,
+    crate_id: CrateId,
+) -> OrderedHashSet<TraitId> {
+    let depandancies = db.crate_traits_dependancies(crate_id);
+    let mut reachable_deps = OrderedHashSet::default();
+    let mut to_visit = vec![trait_id];
+    let mut visited: OrderedHashSet<TraitId, RandomState> = OrderedHashSet::default();
+    while let Some(current_trait) = to_visit.pop() {
+        if visited.contains(&current_trait) {
+            continue;
+        }
+        visited.insert(current_trait);
+        if let Some(deps) = depandancies.get(&current_trait) {
+            for dep in deps.iter() {
+                reachable_deps.insert(*dep);
+                if !visited.contains(dep) {
+                    to_visit.push(*dep);
+                }
+            }
+        }
+    }
+    reachable_deps
+}
+
+fn uninferred_impl_trait_dependecy(
+    db: &dyn SemanticGroup,
+    impl_id: UninferredImpl,
+    trait_deps: &mut OrderedHashMap<TraitId, OrderedHashSet<TraitId>>,
+) -> Maybe<()> {
+    if let Ok(imp_trait_id) = impl_id.trait_id(db) {
+        match impl_id {
+            UninferredImpl::Def(impl_def_id) => {
+                let module_file_id = impl_def_id.module_file_id(db);
+                let mut diagnostics = SemanticDiagnostics::default();
+
+                let impl_ast = db.module_impl_by_id(impl_def_id)?.to_maybe()?;
+                let inference_id = InferenceId::ImplDefTrait(impl_def_id);
+
+                let mut resolver = Resolver::new(db, module_file_id, inference_id);
+                resolver.set_feature_config(&impl_def_id, &impl_ast, &mut diagnostics);
+
+                if let OptionWrappedGenericParamList::WrappedGenericParamList(params_list) =
+                    impl_ast.generic_params(db)
+                {
+                    params_list.generic_params(db).elements(db).for_each(|param_syntax| {
+                        let generic_param_id =
+                            GenericParamLongId(module_file_id, param_syntax.stable_ptr(db))
+                                .intern(db);
+                        resolver.add_generic_param(generic_param_id);
+                        let dependant_trait_id = match param_syntax {
+                            ast::GenericParam::ImplNamed(impl_param) => resolve_trait_path(
+                                db,
+                                &mut diagnostics,
+                                &mut resolver,
+                                &impl_param.trait_path(db),
+                            ),
+                            ast::GenericParam::ImplAnonymous(impl_param) => resolve_trait_path(
+                                db,
+                                &mut diagnostics,
+                                &mut resolver,
+                                &impl_param.trait_path(db),
+                            ),
+                            ast::GenericParam::NegativeImpl(impl_param) => resolve_trait_path(
+                                db,
+                                &mut diagnostics,
+                                &mut resolver,
+                                &impl_param.trait_path(db),
+                            ),
+                            _ => {
+                                return;
+                            }
+                        };
+                        let Ok(dependant_trait_id) = dependant_trait_id else {
+                            return;
+                        };
+                        trait_deps.entry(imp_trait_id).or_default().insert(dependant_trait_id);
+                    })
+                };
+            }
+            UninferredImpl::ImplAlias(impl_alias_id) => {
+                let module_file_id = impl_alias_id.module_file_id(db);
+                let mut diagnostics = SemanticDiagnostics::default();
+
+                let impl_ast = db.module_impl_alias_by_id(impl_alias_id)?.to_maybe()?;
+                let inference_id = InferenceId::ImplAliasImplDef(impl_alias_id);
+
+                let mut resolver = Resolver::new(db, module_file_id, inference_id);
+                resolver.set_feature_config(&impl_alias_id, &impl_ast, &mut diagnostics);
+
+                if let OptionWrappedGenericParamList::WrappedGenericParamList(params_list) =
+                    impl_ast.generic_params(db)
+                {
+                    params_list.generic_params(db).elements(db).for_each(|param_syntax| {
+                        let generic_param_id =
+                            GenericParamLongId(module_file_id, param_syntax.stable_ptr(db))
+                                .intern(db);
+                        resolver.add_generic_param(generic_param_id);
+                        let dependant_trait_id = match param_syntax {
+                            ast::GenericParam::ImplNamed(impl_param) => resolve_trait_path(
+                                db,
+                                &mut diagnostics,
+                                &mut resolver,
+                                &impl_param.trait_path(db),
+                            ),
+                            ast::GenericParam::ImplAnonymous(impl_param) => resolve_trait_path(
+                                db,
+                                &mut diagnostics,
+                                &mut resolver,
+                                &impl_param.trait_path(db),
+                            ),
+                            ast::GenericParam::NegativeImpl(impl_param) => resolve_trait_path(
+                                db,
+                                &mut diagnostics,
+                                &mut resolver,
+                                &impl_param.trait_path(db),
+                            ),
+                            _ => {
+                                return;
+                            }
+                        };
+                        let Ok(dependant_trait_id) = dependant_trait_id else {
+                            return;
+                        };
+                        trait_deps.entry(imp_trait_id).or_default().insert(dependant_trait_id);
+                    })
+                }
+            }
+            _ => {}
+        }
+    };
+    Ok(())
+}
+
+#[derive(Default, Debug, Eq, PartialEq)]
+pub struct ModuleImpls {
+    globals_by_trait: OrderedHashMap<TraitId, OrderedHashSet<UninferredImplById>>,
+    trait_deps: OrderedHashMap<TraitId, OrderedHashSet<TraitId>>,
+    globals_by_type: OrderedHashMap<TypeId, Vec<UninferredImpl>>,
+
+    locals: BTreeSet<UninferredImplById>,
+}
+
+pub fn module_global_impls(db: &dyn SemanticGroup, module_id: ModuleId) -> Maybe<Arc<ModuleImpls>> {
+    
+    let mut module_impls = ModuleImpls::default();
+    let t = &(module_id, module_id);
+    let star_modules = db.priv_module_use_star_modules(module_id);
+    for (user_module, containing_module) in chain!([t], star_modules.accessible.iter()) {
+        let Ok(module_semantic_data) = db.priv_module_semantic_data(*containing_module) else {
+            continue;
+        };
+        for item in module_semantic_data.items.values().filter(|item| {
+            peek_visible_in(db.upcast(), item.visibility, *containing_module, *user_module)
+        }) {
+            let imp = match item.item_id {
+                ModuleItemId::Use(use_id) => match db.use_resolved_item(use_id) {
+                    Ok(ResolvedGenericItem::Impl(impl_def_id)) => UninferredImpl::Def(impl_def_id),
+                    Ok(ResolvedGenericItem::GenericImplAlias(impl_alias_id)) => {
+                        UninferredImpl::ImplAlias(impl_alias_id)
+                    }
+                    _ => continue,
+                },
+                ModuleItemId::Impl(impl_def_id) => {
+                    if let Ok(Some(impl_ast)) = db.module_impl_by_id(impl_def_id) {
+                        global_impls_insert_generic_impls(
+                            db,
+                            &impl_ast.generic_params(db),
+                            impl_def_id.module_file_id(db),
+                            &mut module_impls.globals_by_trait,
+                        );
+                    }
+
+                    // if let Ok(data) = db.priv_impl_definition_data(impl_def_id) {
+                    //     for (function_id, function_syntax) in data.function_asts {
+                    //         let declaration = function_syntax.declaration(db);
+                    //         global_impls_insert_generic_impls(
+                    //             db,
+                    //             &declaration.generic_params(db),
+                    //             function_id.module_file_id(db),
+                    //             &mut module_impls.globals_by_trait,
+                    //         );
+                    //     }
+                    // }
+                    UninferredImpl::Def(impl_def_id)
+                }
+                ModuleItemId::ImplAlias(impl_alias_id) => UninferredImpl::ImplAlias(impl_alias_id),
+                ModuleItemId::FreeFunction(free_function_id) => {
+                    if let Ok(Some(funciton_ast)) = db.module_free_function_by_id(free_function_id)
+                    {
+                        let declaration = funciton_ast.declaration(db);
+                        global_impls_insert_generic_impls(
+                            db,
+                            &declaration.generic_params(db),
+                            free_function_id.module_file_id(db),
+                            &mut module_impls.globals_by_trait,
+                        );
+                    }
+                    continue;
+                }
+                _ => continue,
+            };
+            uninferred_impl_trait_dependecy(db, imp, &mut module_impls.trait_deps)?;
+
+            if let Ok(true) = is_global_impl(db, imp, module_id) {
+                let trait_id = imp.trait_id(db)?;
+                module_impls.globals_by_trait.entry(trait_id).or_default().insert(imp.into());
+            } else {
+                module_impls.locals.insert(imp.into());
+            }
+        }
+    }
+    // println!("module {:?}", module_id.name(db));
+
+    // for (td,s) in module_impls.trait_deps.iter() {
+
+    //     println!("trait {:?} depends on {{{:?}}}", td.debug(db.elongate()), s.iter().map(|x|
+    // x.debug(db.elongate())).collect::<Vec<_>>()); }
+
+    if module_id.full_path(db).contains("3153") {
+        println!("module_global_impls {:?}", module_id.name(db));
+        println!("globals_by_trait: {:?}", module_impls.globals_by_trait.len());
+        println!("trait_deps: {:?}", module_impls.trait_deps.len());
+        println!("globals_by_type: {:?}", module_impls.globals_by_type.len());
+        println!("locals: {:?}", module_impls.locals.len());
+
+        for x in module_impls.globals_by_trait.iter() {
+            println!("trait {:?} has {} impls", x.0.debug(db.elongate()), x.1.len());
+        }
+        for x in module_impls.locals.iter() {
+            println!("local impl {:?}", x.0.debug(db.elongate()));
+        }
+    }
+
+    Ok(module_impls.into())
+}
+
+fn is_global_impl(
+    db: &dyn SemanticGroup,
+    impl_id: UninferredImpl,
+    impl_module: ModuleId,
+) -> Maybe<bool> {
+    // println!("is global {:?} {:?}", impl_id.debug(db.elongate()),impl_module);
+    let trait_id = impl_id.trait_id(db)?;
+    if trait_id.module_file_id(db).0 == impl_module {
+        return Ok(true);
+    }
+
+    if impl_id
+        .trait_shallow_generic_args(db)?
+        .iter()
+        .any(|arg| arg.module_id(db) == Some(impl_module))
+    {
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+fn global_impls_insert_generic_impls(
+    db: &dyn SemanticGroup,
+    generic_params: &ast::OptionWrappedGenericParamList,
+    module_file_id: ModuleFileId,
+    globals_by_trait: &mut OrderedHashMap<TraitId, OrderedHashSet<UninferredImplById>>,
+) {
+    let ast::OptionWrappedGenericParamList::WrappedGenericParamList(generic_params) =
+        generic_params
+    else {
+        return;
+    };
+    let mut generic_types = OrderedHashMap::<SmolStr, GenericParamId, _>::default();
+    for param in generic_params.generic_params(db).elements(db) {
+        match &param {
+            ast::GenericParam::Type(_) => {
+                let param_id = GenericParamLongId(module_file_id, param.stable_ptr(db)).intern(db);
+                if let Some(name) = param_id.name(db) {
+                    generic_types.insert(name, param_id);
+                }
+            }
+            ast::GenericParam::ImplNamed(impl_param) => {
+                if is_global_impl_generic_param(db, &generic_types, &impl_param.trait_path(db)) {
+                    let uninferred_impl = UninferredImpl::GenericParam(
+                        GenericParamLongId(module_file_id, param.stable_ptr(db)).intern(db),
+                    );
+                    if let Ok(trait_id) = uninferred_impl.trait_id(db) {
+                        if trait_id == db.core_info().type_eq_trt {
+                            continue;
+                        }
+                        globals_by_trait
+                            .entry(trait_id)
+                            .or_default()
+                            .insert(uninferred_impl.into());
+                    }
+                }
+            }
+            ast::GenericParam::ImplAnonymous(impl_param) => {
+                if is_global_impl_generic_param(db, &generic_types, &impl_param.trait_path(db)) {
+                    let uninferred_impl = UninferredImpl::GenericParam(
+                        GenericParamLongId(module_file_id, param.stable_ptr(db)).intern(db),
+                    );
+                    if let Ok(trait_id) = uninferred_impl.trait_id(db) {
+                        if trait_id == db.core_info().type_eq_trt {
+                            continue;
+                        }
+                        globals_by_trait
+                            .entry(trait_id)
+                            .or_default()
+                            .insert(uninferred_impl.into());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Computes the semantic model of an impl generic parameter given its trait path.
+fn is_global_impl_generic_param(
+    db: &dyn SemanticGroup,
+    generic_types: &OrderedHashMap<SmolStr, GenericParamId>,
+    trait_syntax: &ast::ExprPath,
+) -> bool {
+    let trait_segments = trait_syntax.to_segments(db);
+    let ast::PathSegment::WithGenericArgs(trait_segment) = trait_segments.last().unwrap() else {
+        return false;
+    };
+
+    let generic_args = trait_segment.generic_args(db);
+
+    for arg in generic_args.generic_args(db).elements(db) {
+        let mut expr = match arg {
+            ast::GenericArg::Unnamed(arg) => match arg.value(db) {
+                GenericArgValue::Expr(generic_arg_value_expr) => generic_arg_value_expr.expr(db),
+                GenericArgValue::Underscore(_) => continue,
+            },
+            ast::GenericArg::Named(arg) => match arg.value(db) {
+                GenericArgValue::Expr(generic_arg_value_expr) => generic_arg_value_expr.expr(db),
+                GenericArgValue::Underscore(_) => continue,
+            },
+        };
+        while let ast::Expr::Unary(unary_expr) = &expr {
+            if !matches!(unary_expr.op(db), UnaryOperator::At(_)) {
+                break;
+            }
+
+            expr = unary_expr.expr(db);
+        }
+
+        let ast::Expr::Path(path) = expr else {
+            continue;
+        };
+        let path_segments = path.to_segments(db);
+        let [segment] = path_segments.as_slice() else {
+            continue;
+        };
+
+        let ast::PathSegment::Simple(simple_segment) = segment else {
+            continue;
+        };
+        if generic_types.contains_key(&simple_segment.ident(db).text(db)) {
+            return true;
+        }
+    }
+
+    false
 }

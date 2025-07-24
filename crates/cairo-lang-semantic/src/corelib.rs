@@ -910,6 +910,7 @@ pub struct CoreInfo {
     pub call_once_fn: TraitFunctionId,
     pub upcast_fn: GenericFunctionId,
     pub downcast_fn: GenericFunctionId,
+    pub tuple_submodule: ModuleId,
 }
 impl CoreInfo {
     fn new(db: &dyn SemanticGroup) -> Self {
@@ -957,6 +958,7 @@ impl CoreInfo {
         let trait_fn = |trait_id: TraitId, name: &str| {
             db.trait_function_by_name(trait_id, name.into()).unwrap().unwrap()
         };
+        let tuple_submodule = core.submodule("tuple").id;
         Self {
             felt252: core.ty("felt252", vec![]),
             u8: integer.ty("u8", vec![]),
@@ -1044,6 +1046,7 @@ impl CoreInfo {
             call_once_fn: trait_fn(fn_once_trt, "call"),
             upcast_fn: bounded_int.generic_function_id("upcast"),
             downcast_fn: bounded_int.generic_function_id("downcast"),
+            tuple_submodule,
         }
     }
 }

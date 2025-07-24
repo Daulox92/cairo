@@ -19,19 +19,22 @@ use cairo_lang_syntax::attribute::structured::Attribute;
 use cairo_lang_syntax::node::{TypedStablePtr, ast};
 use cairo_lang_utils::ordered_hash_map::OrderedHashMap;
 use cairo_lang_utils::ordered_hash_set::OrderedHashSet;
+use cairo_lang_utils::unordered_hash_map::UnorderedHashMap;
+use cairo_lang_utils::unordered_hash_set::UnorderedHashSet;
 use cairo_lang_utils::{LookupIntern, Upcast, require};
 use smol_str::SmolStr;
 
 use crate::corelib::CoreInfo;
 use crate::diagnostic::SemanticDiagnosticKind;
-use crate::expr::inference::{self, ImplVar, ImplVarId, InferenceError};
+use crate::expr::inference::{self, ImplVar, ImplVarId, InferenceResult, InferenceError};
 use crate::ids::{AnalyzerPluginId, AnalyzerPluginLongId};
 use crate::items::constant::{ConstCalcInfo, ConstValueId, Constant, ImplConstantId};
 use crate::items::function_with_body::FunctionBody;
 use crate::items::functions::{GenericFunctionId, ImplicitPrecedence, InlineConfiguration};
 use crate::items::generics::{GenericParam, GenericParamData, GenericParamsData};
 use crate::items::imp::{
-    ImplId, ImplImplId, ImplItemInfo, ImplLookupContext, ImplicitImplImplData, UninferredImpl,
+    GenericsHeadFilter, ImplId, ImplImplId, ImplItemInfo, ImplLookupContextId,
+    ImplicitImplImplData, ModuleImpls, TraitFilter, UninferredImpl, UninferredImplById,
 };
 use crate::items::macro_declaration::{MacroDeclarationData, MacroRuleData};
 use crate::items::module::{ModuleItemInfo, ModuleSemanticData};
@@ -44,9 +47,10 @@ use crate::items::visibility::Visibility;
 use crate::plugin::{AnalyzerPlugin, InternedPluginSuite, PluginSuite};
 use crate::resolve::{ResolvedConcreteItem, ResolvedGenericItem, ResolverData};
 use crate::substitution::GenericSubstitution;
-use crate::types::{ImplTypeById, ImplTypeId, TypeSizeInformation};
+use crate::types::{ImplTypeById, ImplTypeId, ShallowGenericArg, TypeSizeInformation};
 use crate::{
-    FunctionId, Parameter, SemanticDiagnostic, TypeId, corelib, items, lsp_helpers, semantic, types,
+    FunctionId, GenericArgumentId, Parameter, SemanticDiagnostic, TypeId, corelib, items,
+    lsp_helpers, semantic, types,
 };
 
 /// Helper trait to make sure we can always get a `dyn SemanticGroup + 'static` from a
@@ -131,6 +135,12 @@ pub trait SemanticGroup:
         &self,
         id: items::imp::UninferredGeneratedImplLongId,
     ) -> items::imp::UninferredGeneratedImplId;
+
+    #[salsa::interned]
+    fn intern_impl_lookup_context(
+        &self,
+        id: items::imp::ImplLookupContext,
+    ) -> items::imp::ImplLookupContextId;
 
     // Const.
     // ====
@@ -696,13 +706,6 @@ pub trait SemanticGroup:
     // Trait filter.
     // ==============
     /// Returns candidate [ImplDefId]s for a specific trait lookup constraint.
-    #[salsa::invoke(items::imp::module_impl_ids_for_trait_filter)]
-    #[salsa::cycle(items::imp::module_impl_ids_for_trait_filter_cycle)]
-    fn module_impl_ids_for_trait_filter(
-        &self,
-        module_id: ModuleId,
-        trait_lookup_constraint: items::imp::TraitFilter,
-    ) -> Maybe<Vec<UninferredImpl>>;
     #[salsa::invoke(items::imp::impl_impl_ids_for_trait_filter)]
     #[salsa::cycle(items::imp::impl_impl_ids_for_trait_filter_cycle)]
     fn impl_impl_ids_for_trait_filter(
@@ -716,7 +719,7 @@ pub trait SemanticGroup:
     fn canonic_trait_solutions(
         &self,
         canonical_trait: inference::canonic::CanonicalTrait,
-        lookup_context: ImplLookupContext,
+        lookup_context: ImplLookupContextId,
         impl_type_bounds: BTreeMap<ImplTypeById, TypeId>,
     ) -> Result<
         inference::solver::SolutionSet<inference::canonic::CanonicalImpl>,
@@ -758,6 +761,18 @@ pub trait SemanticGroup:
     /// a trait.
     #[salsa::invoke(items::imp::impl_def_trait)]
     fn impl_def_trait(&self, impl_def_id: ImplDefId) -> Maybe<TraitId>;
+
+    #[salsa::invoke(items::imp::impl_def_shallow_trait_generic_args)]
+    fn impl_def_shallow_trait_generic_args(
+        &self,
+        impl_def_id: ImplDefId,
+    ) -> Maybe<Arc<[ShallowGenericArg]>>;
+    #[salsa::invoke(items::imp::impl_alias_trait_generic_args)]
+    fn impl_alias_trait_generic_args(
+        &self,
+        impl_def_id: ImplAliasId,
+    ) -> Maybe<Arc<[ShallowGenericArg]>>;
+
     /// Private query to compute declaration data about an impl.
     #[salsa::invoke(items::imp::priv_impl_declaration_data)]
     #[salsa::cycle(items::imp::priv_impl_declaration_data_cycle)]
@@ -935,7 +950,12 @@ pub trait SemanticGroup:
     /// Returns the deref chain and diagnostics for a given type.
     #[salsa::invoke(items::imp::deref_chain)]
     #[salsa::cycle(items::imp::deref_chain_cycle)]
-    fn deref_chain(&self, ty: TypeId, try_deref_mut: bool) -> Maybe<items::imp::DerefChain>;
+    fn deref_chain(
+        &self,
+        ty: TypeId,
+        crate_id: CrateId,
+        try_deref_mut: bool,
+    ) -> Maybe<items::imp::DerefChain>;
 
     // Impl type.
     // ================
@@ -1182,6 +1202,58 @@ pub trait SemanticGroup:
         &self,
         impl_function_id: ImplFunctionId,
     ) -> Maybe<items::function_with_body::FunctionBodyData>;
+
+    #[salsa::invoke(items::imp::impl_lookup_context_insert_lookup_scope)]
+    fn impl_lookup_context_insert_lookup_scope(
+        &self,
+        impl_lookup_context_id: ImplLookupContextId,
+        uninferred_impl: UninferredImpl,
+    ) -> ImplLookupContextId;
+
+    #[salsa::invoke(items::imp::impl_lookup_context_insert_module)]
+    fn impl_lookup_context_insert_module(
+        &self,
+        impl_lookup_context_id: ImplLookupContextId,
+        module_id: ModuleId,
+    ) -> ImplLookupContextId;
+
+    #[salsa::invoke(items::imp::crate_global_impls)]
+    fn crate_global_impls(
+        &self,
+        crate_id: CrateId,
+    ) -> Maybe<Arc<UnorderedHashMap<TraitId, OrderedHashSet<UninferredImplById>>>>;
+
+    #[salsa::invoke(items::imp::crate_dependancies)]
+    fn crate_dependancies(&self, crate_id: CrateId) -> Maybe<Arc<UnorderedHashSet<CrateId>>>;
+
+    #[salsa::invoke(items::imp::crate_traits_dependancies)]
+    fn crate_traits_dependancies(
+        &self,
+        crate_id: CrateId,
+    ) -> Arc<UnorderedHashMap<TraitId, OrderedHashSet<TraitId>>>;
+    #[salsa::invoke(items::imp::reachable_trait_depandancies)]
+    fn reachable_trait_depandancies(
+        &self,
+        trait_id: TraitId,
+        crate_id: CrateId,
+    ) -> OrderedHashSet<TraitId>;
+
+    #[salsa::invoke(items::imp::module_global_impls)]
+    fn module_global_impls(&self, module_id: ModuleId) -> Maybe<Arc<ModuleImpls>>;
+
+    #[salsa::invoke(items::imp::trait_candidate_by_head)]
+    fn trait_candidate_by_head(
+        &self,
+        crate_id: CrateId,
+        trait_id: TraitId,
+    ) -> Arc<OrderedHashMap<GenericsHeadFilter, OrderedHashSet<UninferredImplById>>>;
+
+    #[salsa::invoke(items::imp::find_candidates_at_context)]
+    fn find_candidates_at_context(
+        &self,
+        lookup_context: ImplLookupContextId,
+        filter: TraitFilter,
+    ) -> Maybe<OrderedHashSet<UninferredImplById>>;
 
     // Implizations.
     // ==============
@@ -1561,7 +1633,7 @@ pub trait SemanticGroup:
 
     /// Returns the type info for a type in a context.
     #[salsa::invoke(types::type_info)]
-    fn type_info(&self, lookup_context: ImplLookupContext, ty: types::TypeId) -> types::TypeInfo;
+    fn type_info(&self, lookup_context: ImplLookupContextId, ty: types::TypeId) -> types::TypeInfo;
 
     /// Returns the `Copy` impl for a type in general context.
     #[salsa::invoke(types::copyable)]

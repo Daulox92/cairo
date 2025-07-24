@@ -9,6 +9,7 @@ use cairo_lang_defs::ids::{
 use cairo_lang_diagnostics::{DiagnosticAdded, Maybe};
 use cairo_lang_proc_macros::SemanticObject;
 use cairo_lang_syntax::attribute::consts::MUST_USE_ATTR;
+use cairo_lang_syntax::node::ast::PathSegment;
 use cairo_lang_syntax::node::db::SyntaxGroup;
 use cairo_lang_syntax::node::ids::SyntaxStablePtrId;
 use cairo_lang_syntax::node::{TypedStablePtr, TypedSyntaxNode, ast};
@@ -20,7 +21,7 @@ use sha3::{Digest, Keccak256};
 use smol_str::SmolStr;
 
 use crate::corelib::{
-    concrete_copy_trait, concrete_destruct_trait, concrete_drop_trait,
+    self, concrete_copy_trait, concrete_destruct_trait, concrete_drop_trait,
     concrete_panic_destruct_trait, core_submodule, get_usize_ty,
 };
 use crate::db::SemanticGroup;
@@ -36,9 +37,9 @@ use crate::expr::inference::{InferenceData, InferenceError, InferenceId, TypeVar
 use crate::items::attribute::SemanticQueryAttrs;
 use crate::items::constant::{ConstValue, ConstValueId, resolve_const_expr_and_evaluate};
 use crate::items::enm::SemanticEnumEx;
+use crate::items::imp::{ImplId, ImplLookupContext, ImplLookupContextId};
 use crate::items::generics::fmt_generic_args;
-use crate::items::imp::{ImplId, ImplLookupContext};
-use crate::resolve::{ResolutionContext, ResolvedConcreteItem, Resolver};
+use crate::resolve::{ResolutionContext, ResolvedConcreteItem, ResolvedGenericItem, Resolver};
 use crate::substitution::SemanticRewriter;
 use crate::{ConcreteTraitId, FunctionId, GenericArgumentId, semantic, semantic_object_for_id};
 
@@ -74,7 +75,9 @@ impl TypeId {
     }
 
     pub fn format(&self, db: &dyn SemanticGroup) -> String {
-        self.lookup_intern(db).format(db)
+        let mut x = self.lookup_intern(db).format(db);
+
+        x
     }
 
     /// Returns [Maybe::Err] if the type is [TypeLongId::Missing].
@@ -136,8 +139,8 @@ impl TypeLongId {
             TypeLongId::Snapshot(inner) => TypeHead::Snapshot(Box::new(inner.head(db)?)),
             TypeLongId::Coupon(_) => TypeHead::Coupon,
             TypeLongId::FixedSizeArray { .. } => TypeHead::FixedSizeArray,
-            TypeLongId::GenericParameter(_)
-            | TypeLongId::Var(_)
+            TypeLongId::GenericParameter(genric_param_id) => TypeHead::Generic(*genric_param_id),
+            TypeLongId::Var(_)
             | TypeLongId::Missing(_)
             | TypeLongId::ImplType(_)
             | TypeLongId::Closure(_) => {
@@ -204,7 +207,7 @@ impl TypeLongId {
                 .module_file_id(db)
                 .map(|module_file_id| module_file_id.0),
             TypeLongId::Missing(_) => None,
-            TypeLongId::Tuple(_) => Some(core_submodule(db, "tuple")),
+            TypeLongId::Tuple(_) => Some(db.core_info().tuple_submodule),
             TypeLongId::ImplType(_) => None,
             TypeLongId::FixedSizeArray { .. } => Some(core_submodule(db, "fixed_size_array")),
             TypeLongId::Closure(closure) => {
@@ -238,7 +241,7 @@ impl DebugWithDb<dyn SemanticGroup> for TypeLongId {
             }
             TypeLongId::Snapshot(ty) => write!(f, "@{}", ty.format(db)),
             TypeLongId::GenericParameter(generic_param) => {
-                write!(f, "{}", generic_param.name(db).unwrap_or_else(|| "_".into()))
+                write!(f, "{}", generic_param.name(db).unwrap_or_else(|| "_".into()),)
             }
             TypeLongId::ImplType(impl_type_id) => {
                 write!(f, "{:?}::{}", impl_type_id.impl_id.debug(db), impl_type_id.ty.name(db))
@@ -265,6 +268,7 @@ impl DebugWithDb<dyn SemanticGroup> for TypeLongId {
 pub enum TypeHead {
     Concrete(GenericTypeId),
     Snapshot(Box<TypeHead>),
+    Generic(GenericParamId),
     Tuple,
     Coupon,
     FixedSizeArray,
@@ -633,6 +637,95 @@ fn maybe_resolve_type(
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShallowGenericArg {
+    GenericParameter(TypeId),
+    GenericType(GenericTypeId),
+    Tuple,
+    FixedSizeArray,
+}
+
+impl ShallowGenericArg {
+    /// Returns the type id of the generic argument.
+    pub fn module_id(&self, db: &dyn SemanticGroup) -> Option<ModuleId> {
+        match self {
+            ShallowGenericArg::GenericParameter(_) => None,
+            ShallowGenericArg::GenericType(ty) => Some(ty.module_file_id(db).0),
+            ShallowGenericArg::Tuple => TypeLongId::Tuple(vec![]).module_id(db),
+            ShallowGenericArg::FixedSizeArray => TypeLongId::FixedSizeArray {
+                type_id: corelib::unit_ty(db),
+                size: ConstValue::Struct(vec![], corelib::unit_ty(db)).intern(db),
+            }
+            .module_id(db),
+        }
+    }
+}
+pub fn maybe_resolve_shallow_generic_arg_type(
+    db: &dyn SemanticGroup,
+    diagnostics: &mut SemanticDiagnostics,
+    resolver: &mut Resolver<'_>,
+    ty_syntax: &ast::Expr,
+) -> Option<ShallowGenericArg> {
+    Some(match ty_syntax {
+        ast::Expr::Path(path) => {
+            if let [PathSegment::Simple(path)] =
+                path.segments(db).elements(db).collect_vec().as_slice()
+            {
+                if let Some(ResolvedConcreteItem::Type(ty)) =
+                    resolver.determine_base_item_in_local_scope(&path.ident(db))
+                {
+                    return Some(ShallowGenericArg::GenericParameter(ty));
+                }
+            }
+            match resolver
+                .resolve_generic_path_with_args(
+                    diagnostics,
+                    path,
+                    NotFoundItemType::Type,
+                    ResolutionContext::Default,
+                )
+                .ok()?
+            {
+                ResolvedGenericItem::GenericType(ty) => ShallowGenericArg::GenericType(ty),
+                _ => {
+                    return None;
+                }
+            }
+        }
+        ast::Expr::Parenthesized(expr_syntax) => maybe_resolve_shallow_generic_arg_type(
+            db,
+            diagnostics,
+            resolver,
+            &expr_syntax.expr(db),
+        )?,
+        ast::Expr::Tuple(_) => ShallowGenericArg::Tuple,
+        ast::Expr::Unary(unary_syntax)
+            if matches!(unary_syntax.op(db), ast::UnaryOperator::At(_)) =>
+        {
+            maybe_resolve_shallow_generic_arg_type(
+                db,
+                diagnostics,
+                resolver,
+                &unary_syntax.expr(db),
+            )?
+        }
+        ast::Expr::Unary(unary_syntax)
+            if matches!(unary_syntax.op(db), ast::UnaryOperator::Desnap(_)) =>
+        {
+            maybe_resolve_shallow_generic_arg_type(
+                db,
+                diagnostics,
+                resolver,
+                &unary_syntax.expr(db),
+            )?
+        }
+        ast::Expr::FixedSizeArray(_) => ShallowGenericArg::FixedSizeArray,
+        _ => {
+            return None;
+        }
+    })
+}
+
 /// Extracts the size of a fixed size array, or none if the size is missing. Reports an error if the
 /// size is not a numeric literal.
 pub fn extract_fixed_size_array_size(
@@ -712,11 +805,11 @@ pub struct TypeInfo {
 /// Checks if there is at least one impl that can be inferred for a specific concrete trait.
 pub fn get_impl_at_context(
     db: &dyn SemanticGroup,
-    lookup_context: ImplLookupContext,
+    lookup_context: ImplLookupContextId,
     concrete_trait_id: ConcreteTraitId,
     stable_ptr: Option<SyntaxStablePtrId>,
 ) -> Result<ImplId, InferenceError> {
-    let constrains = db.generic_params_type_constraints(lookup_context.generic_params.clone());
+    let constrains = db.generic_params_type_constraints(lookup_context.lookup_intern(db).generic_params);
     if constrains.is_empty() && concrete_trait_id.is_var_free(db) {
         return solve_concrete_trait_no_constraints(db, lookup_context, concrete_trait_id);
     }
@@ -894,16 +987,14 @@ pub fn type_size_info_cycle(
 /// Query implementation of [crate::db::SemanticGroup::type_info].
 pub fn type_info(
     db: &dyn SemanticGroup,
-    lookup_context: ImplLookupContext,
+    lookup_context: ImplLookupContextId,
     ty: TypeId,
 ) -> TypeInfo {
     // Dummy stable pointer for type inference variables, since inference is disabled.
-    let droppable =
-        get_impl_at_context(db, lookup_context.clone(), concrete_drop_trait(db, ty), None);
-    let copyable =
-        get_impl_at_context(db, lookup_context.clone(), concrete_copy_trait(db, ty), None);
+    let droppable = get_impl_at_context(db, lookup_context, concrete_drop_trait(db, ty), None);
+    let copyable = get_impl_at_context(db, lookup_context, concrete_copy_trait(db, ty), None);
     let destruct_impl =
-        get_impl_at_context(db, lookup_context.clone(), concrete_destruct_trait(db, ty), None);
+        get_impl_at_context(db, lookup_context, concrete_destruct_trait(db, ty), None);
     let panic_destruct_impl =
         get_impl_at_context(db, lookup_context, concrete_panic_destruct_trait(db, ty), None);
     TypeInfo { droppable, copyable, destruct_impl, panic_destruct_impl }
@@ -913,10 +1004,12 @@ pub fn type_info(
 /// Only works when the given trait is var free.
 fn solve_concrete_trait_no_constraints(
     db: &dyn SemanticGroup,
-    mut lookup_context: ImplLookupContext,
+    lookup_context: ImplLookupContextId,
     id: ConcreteTraitId,
 ) -> Result<ImplId, InferenceError> {
+    let mut lookup_context = lookup_context.lookup_intern(db);
     enrich_lookup_context(db, id, &mut lookup_context);
+    let lookup_context = lookup_context.intern(db);
     match db.canonic_trait_solutions(
         CanonicalTrait { id, mappings: Default::default() },
         lookup_context,
@@ -930,12 +1023,20 @@ fn solve_concrete_trait_no_constraints(
 
 /// Query implementation of [crate::db::SemanticGroup::copyable].
 pub fn copyable(db: &dyn SemanticGroup, ty: TypeId) -> Result<ImplId, InferenceError> {
-    solve_concrete_trait_no_constraints(db, Default::default(), concrete_copy_trait(db, ty))
+    solve_concrete_trait_no_constraints(db, ImplLookupContext::default(ty
+                .lookup_intern(db)
+                .module_id(db)
+                .map(|m| m.owning_crate(db))
+                .unwrap_or_else(|| db.core_crate()),).intern(db), concrete_copy_trait(db, ty))
 }
 
 /// Query implementation of [crate::db::SemanticGroup::droppable].
 pub fn droppable(db: &dyn SemanticGroup, ty: TypeId) -> Result<ImplId, InferenceError> {
-    solve_concrete_trait_no_constraints(db, Default::default(), concrete_drop_trait(db, ty))
+    solve_concrete_trait_no_constraints(db, ImplLookupContext::default(ty
+                .lookup_intern(db)
+                .module_id(db)
+                .map(|m| m.owning_crate(db))
+                .unwrap_or_else(|| db.core_crate()),).intern(db), concrete_drop_trait(db, ty))
 }
 
 pub fn priv_type_is_fully_concrete(db: &dyn SemanticGroup, ty: TypeId) -> bool {
